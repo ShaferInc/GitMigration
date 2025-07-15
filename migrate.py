@@ -2,68 +2,54 @@ import requests
 import subprocess
 import os
 import shutil
-import stat # Import the stat module
+import stat
 from dotenv import load_dotenv
-
-# --- SETUP ---
-# This will load variables from a file named '.env' in the same directory.
-# Your .env file should look like this:
-# E_GITLAB_URL="https://gitlab.yourschool.edu"
-# E_GITLAB_TOKEN="your_gitlab_token_here"
-# E_GITHUB_USERNAME="your_github_username"
-# E_GITHUB_TOKEN="your_github_token_here"
-#
-# IMPORTANT: This script now uses SSH to clone from GitLab.
-# You MUST have an SSH key set up on your machine and added to your GitLab account.
-# Test this with: ssh -T git@gitlab.yourschool.edu
 
 load_dotenv()
 
 # --- CONFIGURATION FROM .ENV FILE ---
-
-# 1. Your school's GitLab instance URL (e.g., https://gitlab.lnu.se)
 GITLAB_URL = os.getenv("E_GITLAB_URL")
-
-# 2. Your GitLab Personal Access Token (with 'api' and 'read_repository' scopes)
 GITLAB_PRIVATE_TOKEN = os.getenv("E_GITLAB_TOKEN")
-
-# 3. Your GitHub username
 GITHUB_USERNAME = os.getenv("E_GITHUB_USERNAME")
-
-# 4. Your GitHub Personal Access Token (with 'repo' scope)
 GITHUB_TOKEN = os.getenv("E_GITHUB_TOKEN")
 
-# 5. Set to True to make new GitHub repos private, False for public.
+# --- SCRIPT CONFIGURATION ---
+# Set to True to make new GitHub repos private, False for public.
 CREATE_PRIVATE_REPOS = True
+# Set the max file size in MB. GitHub's limit is 100MB.
+# We use 99MB to be safe.
+MAX_FILE_SIZE_MB = 99
+# Log file to track completed migrations.
+COMPLETED_LOG_FILE = "migration_log.txt"
 
 # --- END OF CONFIGURATION ---
 
-# New error handler for shutil.rmtree to handle read-only files on Windows
 def handle_remove_readonly(func, path, exc_info):
-    """
-    Error handler for shutil.rmtree.
-
-    If the error is a PermissionError, it changes the file to be writable
-    and then re-attempts the removal. Otherwise, it re-raises the error.
-    
-    Usage: shutil.rmtree(path, onerror=handle_remove_readonly)
-    """
-    # exc_info contains (type, value, traceback)
     excvalue = exc_info[1]
     if func in (os.rmdir, os.remove, os.unlink) and isinstance(excvalue, PermissionError):
-        os.chmod(path, stat.S_IRWXU | stat.S_IRWXG | stat.S_IRWXO)  # 0777
+        os.chmod(path, stat.S_IRWXU | stat.S_IRWXG | stat.S_IRWXO)
         func(path)
     else:
         raise
 
+def load_completed_migrations():
+    """Loads the set of already migrated repo names from the log file."""
+    if not os.path.exists(COMPLETED_LOG_FILE):
+        return set()
+    with open(COMPLETED_LOG_FILE, "r") as f:
+        return set(line.strip() for line in f)
+
+def log_completed_migration(project_name):
+    """Appends a successfully migrated repo name to the log file."""
+    with open(COMPLETED_LOG_FILE, "a") as f:
+        f.write(f"{project_name}\n")
+
 def get_gitlab_projects():
-    """Fetches a list of all projects the user is a member of from GitLab."""
+    # This function is unchanged.
     print("Fetching all member projects from GitLab...")
-    
     api_url = f"{GITLAB_URL}/api/v4/projects"
     headers = {"PRIVATE-TOKEN": GITLAB_PRIVATE_TOKEN}
     params = {"membership": "true", "per_page": 100} 
-
     all_projects = []
     page = 1
     while True:
@@ -72,32 +58,24 @@ def get_gitlab_projects():
             response = requests.get(api_url, headers=headers, params=params)
             response.raise_for_status()
             projects = response.json()
-            if not projects:
-                break 
+            if not projects: break 
             all_projects.extend(projects)
             page += 1
         except requests.exceptions.RequestException as e:
             print(f"Error fetching projects from GitLab: {e}")
             return None
-
     print(f"Successfully found {len(all_projects)} projects.")
     return all_projects
 
-
 def create_github_repo(project_name, description):
-    """Creates a new repository on GitHub, or confirms if it already exists."""
+    # This function is unchanged.
     print(f"Checking for GitHub repository '{project_name}'...")
-    
     check_url = f"https://api.github.com/repos/{GITHUB_USERNAME}/{project_name}"
     headers = {"Authorization": f"token {GITHUB_TOKEN}"}
-    
     response = requests.get(check_url, headers=headers)
-    
     if response.status_code == 200:
-        print(f"Repository '{project_name}' already exists on GitHub. Proceeding to mirror.")
-        repo_data = response.json()
-        return repo_data["clone_url"]
-
+        print(f"Repository '{project_name}' already exists on GitHub. Proceeding to transfer.")
+        return response.json()["clone_url"]
     elif response.status_code == 404:
         print(f"Repository does not exist. Creating '{project_name}' on GitHub...")
         create_url = "https://api.github.com/user/repos"
@@ -115,63 +93,76 @@ def create_github_repo(project_name, description):
         print(f"Error checking for repository '{project_name}': {response.status_code} - {response.text}")
         return None
 
+def transfer_repository(project_name, gitlab_ssh_url, github_clone_url):
+    """
+    Clones, filters large files, and pushes a repository to GitHub.
+    This is no longer a simple mirror.
+    """
+    # Clean up previous attempt
+    if os.path.exists(project_name):
+        print(f"Removing existing local directory '{project_name}'...")
+        shutil.rmtree(project_name, onerror=handle_remove_readonly)
 
-def mirror_repository(gitlab_ssh_url, github_clone_url):
-    """Clones a repo from GitLab using SSH and mirrors it to GitHub."""
-    repo_name_with_git = gitlab_ssh_url.split('/')[-1]
-    local_mirror_path = repo_name_with_git
-    
-    if os.path.exists(local_mirror_path):
-        print(f"Removing existing local directory '{local_mirror_path}'...")
-        # Use the error handler to remove potentially read-only files
-        shutil.rmtree(local_mirror_path, onerror=handle_remove_readonly)
-
-    print(f"1. Mirroring '{repo_name_with_git}' from GitLab using SSH...")
+    print(f"1. Cloning '{project_name}' from GitLab using SSH...")
     try:
-        result = subprocess.run(
-            ["git", "clone", "--mirror", gitlab_ssh_url, local_mirror_path], 
+        subprocess.run(
+            ["git", "clone", gitlab_ssh_url, project_name], 
             check=True, capture_output=True, text=True
         )
     except subprocess.CalledProcessError as e:
-        print(f"  ERROR: Failed to clone from GitLab via SSH.")
-        print(f"  Please ensure your SSH key is added to your GitLab account.")
-        print(f"  Git Command Output:\n{e.stderr}")
+        print(f"  ERROR: Failed to clone from GitLab via SSH.\n{e.stderr}")
         return False
 
     original_cwd = os.getcwd()
-    os.chdir(local_mirror_path)
+    os.chdir(project_name)
 
-    print("2. Pushing mirror to GitHub...")
+    print(f"2. Filtering repository to remove files larger than {MAX_FILE_SIZE_MB}MB...")
+    try:
+        # This command removes blobs (files) bigger than the specified size from history
+        subprocess.run(
+            ["git", "filter-repo", f"--strip-blobs-bigger-than", f"{MAX_FILE_SIZE_MB}M"],
+            check=True, capture_output=True, text=True
+        )
+    except subprocess.CalledProcessError as e:
+        print(f"  ERROR: Failed to filter repository. Is git-filter-repo installed?\n{e.stderr}")
+        os.chdir(original_cwd)
+        shutil.rmtree(project_name, onerror=handle_remove_readonly)
+        return False
+
+    print("3. Pushing filtered repository to GitHub...")
     try:
         authenticated_github_url = github_clone_url.replace(
             "https://", f"https://{GITHUB_USERNAME}:{GITHUB_TOKEN}@"
         )
-        result = subprocess.run(
-            ["git", "push", "--mirror", authenticated_github_url], 
-            check=True, capture_output=True, text=True
-        )
+        # Set the new remote URL and push all branches and tags
+        subprocess.run(["git", "remote", "set-url", "origin", authenticated_github_url], check=True)
+        subprocess.run(["git", "push", "origin", "--all"], check=True, capture_output=True, text=True)
+        subprocess.run(["git", "push", "origin", "--tags"], check=True, capture_output=True, text=True)
     except subprocess.CalledProcessError as e:
-        print(f"  ERROR: Failed to push to GitHub.")
-        print(f"  Git Command Output:\n{e.stderr}")
+        print(f"  ERROR: Failed to push to GitHub.\n{e.stderr}")
         os.chdir(original_cwd)
-        # Use the error handler here as well for cleanup on failure
-        shutil.rmtree(local_mirror_path, onerror=handle_remove_readonly)
+        shutil.rmtree(project_name, onerror=handle_remove_readonly)
         return False
     
+    # Cleanup
     os.chdir(original_cwd)
-    # And use the error handler for the final successful cleanup
-    shutil.rmtree(local_mirror_path, onerror=handle_remove_readonly)
-    print(f"Successfully mirrored '{repo_name_with_git}'.\n")
+    shutil.rmtree(project_name, onerror=handle_remove_readonly)
+    print(f"Successfully transferred '{project_name}'.\n")
     return True
-
 
 def main():
     """Main function to run the migration."""
+    # Check for git-filter-repo before starting
+    if not shutil.which("git-filter-repo"):
+        print("\nFATAL ERROR: 'git-filter-repo' is not installed or not in your PATH.")
+        print("Please install it by running: python -m pip install git-filter-repo")
+        return
+
     print("--- Starting GitLab to GitHub Migration Script ---")
     
-    if not all([GITLAB_URL, GITLAB_PRIVATE_TOKEN, GITHUB_USERNAME, GITHUB_TOKEN]):
-        print("\nFATAL ERROR: One or more environment variables are missing from your .env file.")
-        return
+    completed_migrations = load_completed_migrations()
+    if completed_migrations:
+        print(f"Found {len(completed_migrations)} previously migrated repositories to skip.")
 
     gitlab_projects = get_gitlab_projects()
 
@@ -181,13 +172,19 @@ def main():
 
     successful_migrations = 0
     failed_migrations = []
+    skipped_migrations = 0
 
     for project in gitlab_projects:
         project_name = project["path"]
-        project_description = project.get("description", "")
-        gitlab_ssh_url = project["ssh_url_to_repo"]
+        
+        # --- LOGIC TO SKIP COMPLETED REPOS ---
+        if project_name in completed_migrations:
+            skipped_migrations += 1
+            continue # Move to the next project
 
         print(f"--- Processing project: {project_name} ---")
+        project_description = project.get("description", "")
+        gitlab_ssh_url = project["ssh_url_to_repo"]
 
         github_clone_url = create_github_repo(project_name, project_description)
 
@@ -196,20 +193,23 @@ def main():
             failed_migrations.append(project_name)
             continue
         
-        success = mirror_repository(gitlab_ssh_url, github_clone_url)
+        # Use the new transfer function
+        success = transfer_repository(project_name, gitlab_ssh_url, github_clone_url)
         if success:
             successful_migrations += 1
+            log_completed_migration(project_name) # Log success
         else:
             failed_migrations.append(project_name)
 
     print("--- Migration Complete ---")
-    print(f"Successfully migrated: {successful_migrations} repositories.")
+    if skipped_migrations > 0:
+        print(f"Skipped: {skipped_migrations} repositories (already migrated).")
+    print(f"Successfully migrated: {successful_migrations} new repositories.")
     if failed_migrations:
         print(f"Failed to migrate: {len(failed_migrations)} repositories:")
         for name in failed_migrations:
             print(f"  - {name}")
     print("--------------------------")
-
 
 if __name__ == "__main__":
     main()
